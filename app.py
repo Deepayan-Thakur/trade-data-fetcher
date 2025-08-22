@@ -1,37 +1,39 @@
-# app.py  – Trade Data Fetcher (Imports + Exports)
+# app.py – Streamlit Trade Data Fetcher (Imports + Exports)
+
 import os, time, traceback
 from typing import List, Tuple
 
 import numpy as np
+import io
 import pandas as pd
 from bs4 import BeautifulSoup
-from flask import Flask, render_template, request, send_file, flash, redirect, url_for
+import streamlit as st
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import Select, WebDriverWait
-from webdriver_manager.chrome import ChromeDriverManager
 
-
-app = Flask(__name__)
-
-
+# ─────────────────────────────────────────────────────────────────────────────
+# WebDriver Setup
 def _prep_driver() -> webdriver.Chrome:
     opts = Options()
     opts.add_argument("--disable-gpu")
     opts.add_argument("--no-sandbox")
+    opts.add_argument("--headless=new")   # headless for server/cloud deploy
     opts.add_argument("--window-size=1500,768")
 
+    # NOTE: On Streamlit Cloud, ChromeDriver path must be handled dynamically
     chromedriver_path = "E:\\softwares used\\chromedriver-win64\\chromedriver.exe"
-
     return webdriver.Chrome(service=Service(chromedriver_path), options=opts)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Table parsing
 def _parse_results_table(page_source: str) -> Tuple[List[List[str]], List[str] | None]:
     """Extract <tbody> rows and optional <tfoot> row from the HTML source."""
-    soup  = BeautifulSoup(page_source, "html.parser")
+    soup = BeautifulSoup(page_source, "html.parser")
     table = soup.find("table", id="example1")
     if not table:
         return [], None
@@ -51,27 +53,29 @@ def _parse_results_table(page_source: str) -> Tuple[List[List[str]], List[str] |
     return rows, footer
 
 
-def fetch_trade_data_import(hsn_code: str, year: str
-                            ) -> Tuple[List[List[str]], List[str] | None]:
-    """Scrape the *imports* commodity‑wise page (month fixed at March)."""
+# ─────────────────────────────────────────────────────────────────────────────
+# Scrapers
+def fetch_trade_data_import(hsn_code: str, year: str) -> Tuple[List[List[str]], List[str] | None]:
     URL = "https://tradestat.commerce.gov.in/meidb/commoditywise_import"
     driver = _prep_driver()
     try:
         driver.get(URL)
         wait = WebDriverWait(driver, 15)
 
-        wait.until(EC.element_to_be_clickable((By.ID, "radio2"))).click()     
-        # Month → March ---------------------------------------------------------
+        wait.until(EC.element_to_be_clickable((By.ID, "radio2"))).click()
+        # Month → March
         month_dd = wait.until(EC.presence_of_element_located((By.NAME, "imddMonth")))
         Select(month_dd).select_by_value("3")
         driver.execute_script("arguments[0].dispatchEvent(new Event('change'));", month_dd)
         time.sleep(0.5)
-        # Year ------------------------------------------------------------------
+
+        # Year
         year_dd = wait.until(EC.presence_of_element_located((By.NAME, "imddYear")))
         Select(year_dd).select_by_value(str(year))
         driver.execute_script("arguments[0].dispatchEvent(new Event('change'));", year_dd)
         time.sleep(0.5)
-        # HSN -------------------------------------------------------------------
+
+        # HSN
         hs_in = wait.until(EC.presence_of_element_located((By.ID, "sp")))
         hs_in.clear(); hs_in.send_keys(hsn_code)
 
@@ -88,9 +92,7 @@ def fetch_trade_data_import(hsn_code: str, year: str
         driver.quit()
 
 
-def fetch_trade_data_export(hsn_code: str, year: str
-                            ) -> Tuple[List[List[str]], List[str] | None]:
-    """Scrape the *exports* commodity‑wise page (month fixed at March)."""
+def fetch_trade_data_export(hsn_code: str, year: str) -> Tuple[List[List[str]], List[str] | None]:
     URL = "https://tradestat.commerce.gov.in/meidb/commoditywise_export"
     driver = _prep_driver()
     try:
@@ -123,86 +125,80 @@ def fetch_trade_data_export(hsn_code: str, year: str
     finally:
         driver.quit()
 
-@app.route("/", methods=["GET", "POST"])
-def index():
-    hsn_input = ""
-    year      = "2025"
 
-    # containers for each flow
-    import_rows: list[tuple[str, list[list[str]]]] = []
-    export_rows: list[tuple[str, list[list[str]]]] = []
-    master_imp:  list[list[str]] = []
-    master_exp:  list[list[str]] = []
-    totals_imp:  list[list[float]] = []
-    totals_exp:  list[list[float]] = []
+# ─────────────────────────────────────────────────────────────────────────────
+# Streamlit App
+st.set_page_config(page_title="Trade Data Fetcher", layout="wide")
 
-    # serial counters per table
-    serial_imp = serial_exp = 1
+st.title("📊 Trade Data Fetcher – Imports & Exports")
+st.markdown("Fetch live trade statistics (HSN-wise) from [TradeStat Portal]"
+            "(https://tradestat.commerce.gov.in)")
 
-    if request.method == "POST":
-        hsn_input = request.form["hsn_code"].strip()
-        year      = request.form["year"]
-        modes     = request.form.getlist("mode")   
+hsn_input = st.text_input("Enter HSN code(s) (comma or space separated):", "")
+year = st.selectbox("Select Year", [str(y) for y in range(2015, 2026)], index=10)
+modes = st.multiselect("Select Mode(s)", ["import", "export"], default=["import", "export"])
+run_btn = st.button("Fetch Data")
 
-        if not modes:
-            flash("Please tick Import and/or Export!", "warning")
-            return redirect(url_for("index"))
-
+if run_btn:
+    if not hsn_input.strip():
+        st.warning("Please enter at least one HSN code.")
+    elif not modes:
+        st.warning("Please select Import and/or Export.")
+    else:
         codes = [c.strip() for c in hsn_input.replace(",", " ").split() if c.strip()]
+        master_imp, master_exp, totals_imp, totals_exp = [], [], [], []
+        serial_imp = serial_exp = 1
 
-        for code in codes:
-            # ─── IMPORTS ──────────────────────────────────────────────────
-            if "import" in modes:
-                rows_i, footer_i = fetch_trade_data_import(code, year)
-                if rows_i:
-                    for r in rows_i:
-                        master_imp.append([serial_imp] + r[:10])
+        with st.spinner("Fetching data, please wait..."):
+            total_tasks = len(codes) * len(modes)  # total number of fetch operations
+            progress_bar = st.progress(0)
+            status_text = st.empty()   # to show what’s happening
+            task_done = 0
+
+            for code in codes:
+                if "import" in modes:
+                    rows_i, footer_i = fetch_trade_data_import(code, year)
+                    if rows_i:
+                        for r in rows_i:
+                            master_imp.append([serial_imp] + r[:10])
+                            serial_imp += 1
+                        if footer_i:
+                            nums = [float(x.replace(",", "").replace("−", "-"))
+                                    if any(ch.isdigit() for ch in x) else 0
+                                    for x in footer_i]
+                            totals_imp.append(nums)
+                    else:
+                        master_imp.append([serial_imp, code] + ["N/A"] * 9)
                         serial_imp += 1
-                    import_rows.append((code, rows_i))
-                    if footer_i:
-                        nums = [float(x.replace(",", "").replace("−", "-"))
-                                if any(ch.isdigit() for ch in x) else 0
-                                for x in footer_i]
-                        totals_imp.append(nums)
-                else:
-                    master_imp.append([serial_imp, code] + ["N/A"] * 9)
-                    serial_imp += 1
 
-            # ─── EXPORTS ────────────────────────────────────────────────────
-            if "export" in modes:
-                rows_e, footer_e = fetch_trade_data_export(code, year)
-                if rows_e:
-                    for r in rows_e:
-                        master_exp.append([serial_exp] + r[:10])
+                    task_done += 1
+                    progress_bar.progress(task_done / total_tasks)
+                    status_text.text(f"Fetching {task_done}/{total_tasks} completed...")
+
+
+                if "export" in modes:
+                    rows_e, footer_e = fetch_trade_data_export(code, year)
+                    if rows_e:
+                        for r in rows_e:
+                            master_exp.append([serial_exp] + r[:10])
+                            serial_exp += 1
+                        if footer_e:
+                            nums = [float(x.replace(",", "").replace("−", "-"))
+                                    if any(ch.isdigit() for ch in x) else 0
+                                    for x in footer_e]
+                            totals_exp.append(nums)
+                    else:
+                        master_exp.append([serial_exp, code] + ["N/A"] * 9)
                         serial_exp += 1
-                    export_rows.append((code, rows_e))
-                    if footer_e:
-                        nums = [float(x.replace(",", "").replace("−", "-"))
-                                if any(ch.isdigit() for ch in x) else 0
-                                for x in footer_e]
-                        totals_exp.append(nums)
-                else:
-                    master_exp.append([serial_exp, code] + ["N/A"] * 9)
-                    serial_exp += 1
 
-        # ─── combined totals for strip(s) ──────────────────────────────────
-        def calc_totals(arr: list[list[float]]):
-            if not arr: return None
-            sums = np.sum(np.asarray(arr), axis=0)
-            mar_r, mar_f = sums[2], sums[3]
-            apr_r, apr_f = sums[5], sums[6]
-            growth_mar = ((mar_f - mar_r) / mar_r * 100) if mar_r else 0
-            growth_fy  = ((apr_f - apr_r) / apr_r * 100) if apr_r else 0
-            return [
-                "ALL",
-                f"{mar_r:,.2f}", f"{mar_f:,.2f}", f"{growth_mar:.2f}",
-                f"{apr_r:,.2f}", f"{apr_f:,.2f}", f"{growth_fy:.2f}",
-            ]
+                    task_done += 1
+                    progress_bar.progress(task_done / total_tasks)
+                    status_text.text(f"Fetching {task_done}/{total_tasks} completed...")
 
-        total_imp = calc_totals(totals_imp)
-        total_exp = calc_totals(totals_exp)
+            progress_bar.empty()
+            status_text.text("✅ Done fetching all data!")
 
-        # ─── Excel files (one per flow) ───────────────────────────────────
+
         headers = [
             "S.No.", "HSCode", "Commodity",
             f"Mar-{int(year)-1} (R)", f"Mar-{year} (F)", "%Growth (Mar)",
@@ -210,51 +206,48 @@ def index():
             "Share %", "Rank"
         ]
 
-        import_fname = export_fname = None
+        # Save results to session_state so they persist across reruns
+        if run_btn:
+            if master_imp:
+                st.session_state["df_imp"] = pd.DataFrame(master_imp, columns=headers)
+            if master_exp:
+                st.session_state["df_exp"] = pd.DataFrame(master_exp, columns=headers)
 
-        if master_imp:
-            import_fname = f"imports_{year}.xlsx"
-            imp_path = os.path.join(app.root_path, import_fname)
-            pd.DataFrame(master_imp, columns=headers).to_excel(imp_path, index=False)
+        # Show Imports if already in session_state
+        if "df_imp" in st.session_state:
+            df_imp = st.session_state["df_imp"]
+            st.subheader("📥 Imports Data")
+            st.dataframe(df_imp, use_container_width=True)
 
-        if master_exp:
-            export_fname = f"exports_{year}.xlsx"
-            exp_path = os.path.join(app.root_path, export_fname)
-            pd.DataFrame(master_exp, columns=headers).to_excel(exp_path, index=False)
+            buffer_imp = io.BytesIO()
+            with pd.ExcelWriter(buffer_imp, engine="openpyxl") as writer:
+                df_imp.to_excel(writer, index=False, sheet_name="Imports")
+            buffer_imp.seek(0)
 
-        return render_template(
-            "index.html",
-            hsn_code=hsn_input,
-            year=year,
-            import_data=import_rows if master_imp else None,
-            export_data=export_rows if master_exp else None,
-            total_imp=total_imp,
-            total_exp=total_exp,
-            import_filename=import_fname,
-            export_filename=export_fname,
-        )
+            # st.download_button(
+            #     label="Download Imports Excel",
+            #     data=buffer_imp,
+            #     file_name=f"imports_{year}.xlsx",
+            #     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            # )
 
+        # Show Exports if already in session_state
+        if "df_exp" in st.session_state:
+            df_exp = st.session_state["df_exp"]
+            st.subheader("📤 Exports Data")
+            st.dataframe(df_exp, use_container_width=True)
 
-    # ─── GET  – first load ────────────────────────────────────────────────
-    return render_template(
-        "index.html",
-        hsn_code=hsn_input,
-        year=year,
-        import_data=None,
-        export_data=None,
-        total_imp=None,
-        total_exp=None,
-        excel_filename=None,
-    )
+            buffer_exp = io.BytesIO()
+            with pd.ExcelWriter(buffer_exp, engine="openpyxl") as writer:
+                df_exp.to_excel(writer, index=False, sheet_name="Exports")
+            buffer_exp.seek(0)
 
-
-@app.route("/download/<filename>")
-def download(filename: str):
-    fpath = os.path.join(app.root_path, filename)
-    return send_file(fpath, as_attachment=True) if os.path.exists(fpath) \
-           else ("file not found", 404)
+            # st.download_button(
+            #     label="Download Exports Excel",
+            #     data=buffer_exp,
+            #     file_name=f"exports_{year}.xlsx",
+            #     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            # )
 
 
-# ───────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    app.run(debug=True)
+st.info("Tip: You can enter multiple HSN codes separated by comma or space.")
